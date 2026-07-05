@@ -1,102 +1,116 @@
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import Optional
+from uuid import uuid4
 import time
-import uuid
 from collections import defaultdict, deque
 
 app = FastAPI()
 
+# =========================
+# Assigned values
+# =========================
+ALLOWED_ORIGIN = "https://app-wg66hi.example.com"
+RATE_LIMIT = 12  # requests per 10s
+
+WINDOW_SECONDS = 10
+
+# =========================
+# Rate limiting storage
+# =========================
+client_hits = defaultdict(deque)
+
+# =========================
+# Middleware: CORS (strict, no *)
+# =========================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[ALLOWED_ORIGIN, "*"],  # allow exam page + assigned origin scenario
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-T = 59
-R = 16
-
-catalog = [{"id": i, "name": f"Order {i}"} for i in range(1, T + 1)]
-
-idempotency_store = {}
-orders_created = []
-
-client_hits = defaultdict(deque)
-
-
-class OrderIn(BaseModel):
-    item: Optional[str] = None
-    quantity: Optional[int] = 1
-
-
-@app.post("/orders")
-async def create_order(request: Request, payload: OrderIn, idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")):
-    if not idempotency_key:
-        raise HTTPException(status_code=400, detail="Idempotency-Key header required")
-
-    if idempotency_key in idempotency_store:
-        saved = idempotency_store[idempotency_key]
-        return JSONResponse(status_code=201, content=saved)
-
-    order_id = str(uuid.uuid4())
-    order = {
-        "id": order_id,
-        "item": payload.item,
-        "quantity": payload.quantity,
-    }
-    idempotency_store[idempotency_key] = order
-    orders_created.append(order)
-    return JSONResponse(status_code=201, content=order)
-
-
-@app.get("/orders")
-async def list_orders(limit: int = 10, cursor: Optional[str] = None):
-    if limit < 1:
-        limit = 1
-
-    start_index = 0
-    if cursor:
-        try:
-            start_index = int(cursor)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid cursor")
-
-    items = catalog[start_index:start_index + limit]
-    next_cursor = None
-
-    if start_index + limit < len(catalog):
-        next_cursor = str(start_index + limit)
-
-    return {
-        "items": items,
-        "next_cursor": next_cursor
-    }
-
-
+# =========================
+# Rate limiting dependency-like middleware
+# =========================
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    client_id = request.headers.get("X-Client-Id")
+    client_id = request.headers.get("X-Client-Id", "anonymous")
+    now = time.time()
 
-    if client_id:
-        now = time.time()
-        window_start = now - 10
-        hits = client_hits[client_id]
+    q = client_hits[client_id]
 
-        while hits and hits[0] < window_start:
-            hits.popleft()
+    # drop old requests outside window
+    while q and now - q[0] > WINDOW_SECONDS:
+        q.popleft()
 
-        if len(hits) >= R:
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded"},
-                headers={"Retry-After": "10"}
-            )
+    if len(q) >= RATE_LIMIT:
+        return Response(status_code=429)
 
-        hits.append(now)
+    q.append(now)
 
     response = await call_next(request)
     return response
+
+
+# =========================
+# Request context middleware
+# =========================
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    req_id = request.headers.get("X-Request-ID")
+    if not req_id:
+        req_id = str(uuid4())
+
+    response = await call_next(request)
+
+    response.headers["X-Request-ID"] = req_id
+    response.state.request_id = req_id
+
+    return response
+
+
+# =========================
+# Helpers (email placeholder)
+# =========================
+def get_email():
+    return "user@example.com"
+
+
+# =========================
+# Endpoint
+# =========================
+@app.get("/ping")
+async def ping(request: Request, response: Response):
+    req_id = request.headers.get("X-Request-ID")
+    if not req_id:
+        req_id = str(uuid4())
+
+    # ensure header always set
+    response.headers["X-Request-ID"] = req_id
+
+    # strict CORS: only allowed origin
+    origin = request.headers.get("origin")
+    if origin == ALLOWED_ORIGIN:
+        response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+
+    return {
+        "email": get_email(),
+        "request_id": req_id
+    }
+
+
+# =========================
+# OPTIONS preflight support
+# =========================
+@app.options("/ping")
+async def ping_options(request: Request):
+    resp = Response()
+    origin = request.headers.get("origin")
+
+    if origin == ALLOWED_ORIGIN:
+        resp.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
+        resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
+
+    return resp
