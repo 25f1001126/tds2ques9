@@ -1,124 +1,102 @@
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
 import time
 import uuid
 from collections import defaultdict, deque
-from typing import Optional
-
-from fastapi import FastAPI, Request, Header, Response, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------- CONFIG ----------------
-TOTAL_ORDERS = 59
-RATE_LIMIT = 16
-WINDOW = 10  # seconds
+T = 59
+R = 16
 
-# ---------------- STORAGE ----------------
+catalog = [{"id": i, "name": f"Order {i}"} for i in range(1, T + 1)]
+
 idempotency_store = {}
-rate_store = defaultdict(deque)
+orders_created = []
+
+client_hits = defaultdict(deque)
 
 
-# ---------------- RATE LIMIT MIDDLEWARE ----------------
-@app.middleware("http")
-async def rate_limit(request: Request, call_next):
-    client_id = request.headers.get("X-Client-Id") or request.headers.get("x-client-id")
-
-    if client_id:
-        now = time.time()
-        q = rate_store[client_id]
-
-        # drop timestamps outside the window
-        while q and now - q[0] > WINDOW:
-            q.popleft()
-
-        if len(q) >= RATE_LIMIT:
-            oldest = q[0]
-            retry_after = max(1, int(WINDOW - (now - oldest)) + 1)
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded"},
-                headers={"Retry-After": str(retry_after)},
-            )
-
-        q.append(now)
-
-    response = await call_next(request)
-    return response
+class OrderIn(BaseModel):
+    item: Optional[str] = None
+    quantity: Optional[int] = 1
 
 
-# ---------------- 1. IDEMPOTENT ORDER CREATION ----------------
 @app.post("/orders")
-async def create_order(
-    response: Response,
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-):
+async def create_order(request: Request, payload: OrderIn, idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")):
     if not idempotency_key:
-        raise HTTPException(status_code=400, detail="Missing Idempotency-Key header")
+        raise HTTPException(status_code=400, detail="Idempotency-Key header required")
 
     if idempotency_key in idempotency_store:
-        response.status_code = 200
-        return idempotency_store[idempotency_key]
+        saved = idempotency_store[idempotency_key]
+        return JSONResponse(status_code=201, content=saved)
 
+    order_id = str(uuid.uuid4())
     order = {
-        "id": str(uuid.uuid4()),
-        "status": "created",
-        "ts": time.time(),
+        "id": order_id,
+        "item": payload.item,
+        "quantity": payload.quantity,
     }
     idempotency_store[idempotency_key] = order
-    response.status_code = 201
-    return order
+    orders_created.append(order)
+    return JSONResponse(status_code=201, content=order)
 
 
-# ---------------- 2. CURSOR PAGINATION ----------------
-# Query params taken as raw strings and parsed manually so malformed/unexpected
-# values (empty string, "None", floats, etc.) never produce a 422 — they just
-# fall back to safe defaults.
 @app.get("/orders")
-def list_orders(request: Request):
-    raw_limit = request.query_params.get("limit")
-    raw_cursor = request.query_params.get("cursor")
-
-    try:
-        limit = int(raw_limit) if raw_limit not in (None, "") else 10
-    except (TypeError, ValueError):
-        limit = 10
+async def list_orders(limit: int = 10, cursor: Optional[str] = None):
     if limit < 1:
         limit = 1
 
-    try:
-        start = int(raw_cursor) if raw_cursor not in (None, "", "None", "null") else 1
-    except (TypeError, ValueError):
-        start = 1
-    if start < 1:
-        start = 1
+    start_index = 0
+    if cursor:
+        try:
+            start_index = int(cursor)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
 
-    end = min(start + limit, TOTAL_ORDERS + 1)
-    if start > TOTAL_ORDERS:
-        items = []
-        next_cursor = None
-    else:
-        items = [{"id": i} for i in range(start, end)]
-        next_cursor = str(end) if end <= TOTAL_ORDERS else None
+    items = catalog[start_index:start_index + limit]
+    next_cursor = None
+
+    if start_index + limit < len(catalog):
+        next_cursor = str(start_index + limit)
 
     return {
         "items": items,
-        "next_cursor": next_cursor,
-        "next": next_cursor,   # alias
-        "orders": items,       # alias
+        "next_cursor": next_cursor
     }
 
 
-# ---------------- HEALTH CHECK ----------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    client_id = request.headers.get("X-Client-Id")
+
+    if client_id:
+        now = time.time()
+        window_start = now - 10
+        hits = client_hits[client_id]
+
+        while hits and hits[0] < window_start:
+            hits.popleft()
+
+        if len(hits) >= R:
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded"},
+                headers={"Retry-After": "10"}
+            )
+
+        hits.append(now)
+
+    response = await call_next(request)
+    return response
